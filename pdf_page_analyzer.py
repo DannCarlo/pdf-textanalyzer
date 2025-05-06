@@ -9,11 +9,14 @@ import pytesseract
 import gc
 import io
 import csv
+from concurrent.futures import ThreadPoolExecutor
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
                              QTextEdit, QLineEdit, QHeaderView, QMessageBox, QProgressBar)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QDoubleValidator, QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QDoubleValidator, QFont, QIcon, QPixmap
+from PyQt5.QtWidgets import QGraphicsDropShadowEffect
+from PyQt5.QtGui import QColor
 
 # Constants
 BLANK_PAGE_CHAR_THRESHOLD = 100
@@ -24,6 +27,7 @@ MAX_IMAGE_DIMENSION = 1000
 PIXEL_SAMPLING_STRIDE = 1000
 OCR_DPI = 100
 TESSERACT_PSM_CONFIG = '--psm 6'
+MAX_WORKERS = 4  # Number of threads for image processing
 
 # Configure Tesseract path
 if getattr(sys, 'frozen', False):
@@ -38,8 +42,9 @@ else:
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize dictionary once for reuse
+# Initialize dictionary and word cache
 dictionary = enchant.Dict("en_US")
+word_cache = {}  # Cache for dictionary lookups
 
 
 # Custom logging handler to emit logs to QTextEdit
@@ -108,7 +113,16 @@ class AnalysisThread(QThread):
         words = re.findall(r'\b\w+\b', text.lower())
         if not words:
             return True
-        valid_words = sum(1 for word in words if dictionary.check(word) and len(word) > 1)
+        valid_words = 0
+        for word in words:
+            if word in word_cache:
+                if word_cache[word]:
+                    valid_words += 1
+            else:
+                is_valid = dictionary.check(word) and len(word) > 1
+                word_cache[word] = is_valid
+                if is_valid:
+                    valid_words += 1
         valid_ratio = valid_words / len(words)
         return valid_ratio < valid_word_threshold
 
@@ -217,11 +231,17 @@ class AnalysisThread(QThread):
                 image_text = ""
                 image_list = self.extract_images_from_page(page)
                 if image_list:
-                    for img_info in image_list:
-                        if not self.is_running:
-                            doc.close()
-                            return None
-                        image_text += self.analyze_image(img_info, page_num, doc) + " "
+                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                        futures = [
+                            executor.submit(self.analyze_image, img_info, page_num, doc)
+                            for img_info in image_list
+                            if self.is_running
+                        ]
+                        for future in futures:
+                            if not self.is_running:
+                                doc.close()
+                                return None
+                            image_text += future.result() + " "
 
                 combined_text = text + " " + image_text
 
@@ -270,6 +290,10 @@ class PDFAnalyzerGUI(QMainWindow):
         self.thread = None
         self.all_page_details = []  # Store all page details for export
         self.init_ui()
+
+        # Set window icon (logo)
+        # Replace 'logo.ico' with the path to your logo file (e.g., 'path/to/logo.ico')
+        self.setWindowIcon(QIcon('logo.ico'))
 
         # Apply modern stylesheet with new colors
         self.setStyleSheet("""
@@ -356,7 +380,7 @@ class PDFAnalyzerGUI(QMainWindow):
         file_layout.addWidget(file_button)
         layout.addLayout(file_layout)
 
-        # Threshold inputs
+        # Threshold inputs with debounce
         threshold_layout = QHBoxLayout()
         blank_label = QLabel("Blank Page Char Threshold:")
         self.blank_threshold_input = QLineEdit(str(BLANK_PAGE_CHAR_THRESHOLD))
@@ -421,6 +445,25 @@ class PDFAnalyzerGUI(QMainWindow):
         self.log_viewer.setReadOnly(True)
         self.log_viewer.setMinimumHeight(150)
         layout.addWidget(self.log_viewer)
+
+        # Apply shadow effects to each widget individually
+        def create_shadow():
+            shadow = QGraphicsDropShadowEffect()
+            shadow.setBlurRadius(15)
+            shadow.setXOffset(0)
+            shadow.setYOffset(5)
+            shadow.setColor(QColor(0, 0, 0, 80))
+            return shadow
+
+        file_button.setGraphicsEffect(create_shadow())
+        self.start_button.setGraphicsEffect(create_shadow())
+        self.cancel_button.setGraphicsEffect(create_shadow())
+        self.export_button.setGraphicsEffect(create_shadow())
+        self.summary_table.setGraphicsEffect(create_shadow())
+        self.results_table.setGraphicsEffect(create_shadow())
+        self.log_viewer.setGraphicsEffect(create_shadow())
+        self.blank_threshold_input.setGraphicsEffect(create_shadow())
+        self.valid_word_threshold_input.setGraphicsEffect(create_shadow())
 
         # Configure logging to display in log viewer
         handler = QTextEditLogger(self.log_viewer)
@@ -498,7 +541,8 @@ class PDFAnalyzerGUI(QMainWindow):
         self.summary_table.setItem(0, 2, QTableWidgetItem(str(gibberish_pages)))
         self.summary_table.setItem(0, 3, QTableWidgetItem(str(billable_pages)))
 
-        # Update Results Table
+        # Update Results Table in batches
+        self.results_table.setUpdatesEnabled(False)  # Disable updates for performance
         row = 0
         for result in results:
             for page_detail in result['page_details']:
@@ -510,6 +554,7 @@ class PDFAnalyzerGUI(QMainWindow):
                 self.results_table.setItem(row, 3, QTableWidgetItem(str(page_detail[3])))  # Text Length
                 row += 1
             self.all_page_details.extend(result['page_details'])
+        self.results_table.setUpdatesEnabled(True)  # Re-enable updates
 
         # Log final summary
         self.log_viewer.append(f"\nFinal Summary:")
