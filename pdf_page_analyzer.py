@@ -1,90 +1,178 @@
 import sys
 import os
-import pytesseract
 import fitz  # PyMuPDF
 import enchant
 import re
 import logging
 from PIL import Image
+import pytesseract
 import gc
+import io
 import csv
-from datetime import datetime
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QFileDialog, QMessageBox, QTextEdit, QTableWidget,
-    QTableWidgetItem, QHeaderView, QScrollArea, QLabel
-)
-from PyQt5.QtCore import Qt, QThread, QObject, pyqtSignal
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
+                             QTextEdit, QLineEdit, QHeaderView, QMessageBox, QProgressBar)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QDoubleValidator, QFont
 
-# Dynamically set the path to Tesseract binary in the bundled app
+# Constants
+BLANK_PAGE_CHAR_THRESHOLD = 100
+VALID_WORD_THRESHOLD = 0.1
+WHITENESS_THRESHOLD = 0.98
+MIN_IMAGE_SIZE_BYTES = 1024
+MAX_IMAGE_DIMENSION = 1000
+PIXEL_SAMPLING_STRIDE = 1000
+OCR_DPI = 100
+TESSERACT_PSM_CONFIG = '--psm 6'
+
+# Configure Tesseract path
 if getattr(sys, 'frozen', False):
     bundle_dir = sys._MEIPASS
     tesseract_path = os.path.join(bundle_dir, 'tesseract', 'tesseract.exe' if sys.platform == 'win32' else 'tesseract')
     pytesseract.pytesseract.tesseract_cmd = tesseract_path
     os.environ['TESSDATA_PREFIX'] = os.path.join(bundle_dir, 'tessdata')
 else:
-    pytesseract.pytesseract.tesseract_cmd = 'tesseract'
+    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
-def is_blank_page(text, char_threshold=50):
-    """Check if page is blank based on character count."""
-    return len(text.strip()) < char_threshold
+# Initialize dictionary once for reuse
+dictionary = enchant.Dict("en_US")
 
-def is_gibberish_page(text, valid_word_threshold=0.1):
-    """Check if page contains mostly gibberish text."""
-    if not text.strip():
-        return False
-    words = re.findall(r'\b\w+\b', text.lower())
-    if not words:
-        return True
-    dictionary = enchant.Dict("en_US")
-    valid_words = sum(1 for word in words if dictionary.check(word) and len(word) > 1)
-    valid_ratio = valid_words / len(words)
-    return valid_ratio < valid_word_threshold
 
-def is_likely_blank_pixmap(pix, whiteness_threshold=0.98):
-    """Check if a pixmap is mostly white (likely blank) by sampling pixels."""
-    if pix.n != 3:  # Ensure RGB format
-        pix = pix.convert_to_rgb()
-    pixels = pix.samples
-    total_pixels = pix.width * pix.height
-    white_pixels = sum(1 for i in range(0, len(pixels), 3) if pixels[i] > 240 and pixels[i+1] > 240 and pixels[i+2] > 240)
-    return (white_pixels / total_pixels) > whiteness_threshold
-
-def extract_text_with_pymupdf_image(page, page_num, log_callback):
-    """Extract text from a page image using PyMuPDF and OCR."""
-    try:
-        pix = page.get_pixmap(dpi=150)
-        if is_likely_blank_pixmap(pix):
-            log_callback(f"Page {page_num} appears blank based on image analysis, skipping OCR")
-            return ""
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.rgb)
-        text = pytesseract.image_to_string(img, lang='eng')
-        log_callback(f"OCR text length for page {page_num}: {len(text)} characters")
-        logger.debug(f"OCR text sample for page {page_num}: {text[:50]}...")
-        pix = None
-        img.close()
-        del img
-        gc.collect()
-        return text
-    except Exception as e:
-        logger.error(f"PyMuPDF image OCR failed for page {page_num}: {e}")
-        log_callback(f"PyMuPDF image OCR failed for page {page_num}: {e}")
-        return ""
-
-class AnalysisWorker(QObject):
-    log_signal = pyqtSignal(str)
-    status_signal = pyqtSignal(str)
-    result_signal = pyqtSignal(dict)
-    finished_signal = pyqtSignal()
-
-    def __init__(self, pdf_files):
+# Custom logging handler to emit logs to QTextEdit
+class QTextEditLogger(logging.Handler):
+    def __init__(self, text_edit):
         super().__init__()
-        self.pdf_files = pdf_files
-        self.csv_data = []
+        self.text_edit = text_edit
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.text_edit.append(msg)
+
+
+# Thread for running PDF analysis
+class AnalysisThread(QThread):
+    update_progress = pyqtSignal(str, int, int)  # message, current, total
+    log_message = pyqtSignal(str)
+    analysis_complete = pyqtSignal(list)  # List of results for multiple PDFs
+    analysis_failed = pyqtSignal(str)
+
+    def __init__(self, pdf_paths, blank_threshold, valid_word_threshold):
+        super().__init__()
+        self.pdf_paths = pdf_paths  # List of PDF paths
+        self.blank_threshold = blank_threshold
+        self.valid_word_threshold = valid_word_threshold
+        self.is_running = True
+
+    def run(self):
+        try:
+            all_results = []
+            total_files = len(self.pdf_paths)
+            for file_idx, pdf_path in enumerate(self.pdf_paths):
+                if not self.is_running:
+                    break
+                self.log_message.emit(f"\nProcessing file: {os.path.basename(pdf_path)}")
+                result = self.analyze_pdf(pdf_path)
+                if result:
+                    # Add filename to page details for Results Table
+                    filename = os.path.basename(pdf_path)
+                    result['filename'] = filename
+                    for detail in result['page_details']:
+                        detail.insert(0, filename)  # Add filename to each page detail
+                    all_results.append(result)
+                # Update progress for file completion
+                self.update_progress.emit(f"Processing {filename}", file_idx + 1, total_files)
+
+            if self.is_running:
+                if all_results:
+                    self.analysis_complete.emit(all_results)
+                else:
+                    self.analysis_failed.emit("Analysis failed. Check the log for details.")
+            else:
+                self.analysis_failed.emit("Analysis cancelled.")
+        except Exception as e:
+            self.analysis_failed.emit(f"Error: {str(e)}")
+
+    def stop(self):
+        self.is_running = False
+
+    def is_blank_page(self, text, char_threshold):
+        return len(text.strip()) < char_threshold
+
+    def is_gibberish_page(self, text, valid_word_threshold):
+        if not text.strip():
+            return False
+        words = re.findall(r'\b\w+\b', text.lower())
+        if not words:
+            return True
+        valid_words = sum(1 for word in words if dictionary.check(word) and len(word) > 1)
+        valid_ratio = valid_words / len(words)
+        return valid_ratio < valid_word_threshold
+
+    def is_likely_blank_pixmap(self, pix, whiteness_threshold=WHITENESS_THRESHOLD):
+        if pix.n != 3:
+            pix = pix.convert_to_rgb()
+        pixels = pix.samples
+        total_pixels = pix.width * pix.height
+        stride = max(1, total_pixels // PIXEL_SAMPLING_STRIDE)
+        white_pixels = sum(
+            1 for i in range(0, len(pixels), stride * 3)
+            if pixels[i] > 240 and pixels[i + 1] > 240 and pixels[i + 2] > 240
+        )
+        return (white_pixels / (total_pixels / stride)) > whiteness_threshold
+
+    def extract_text_with_pymupdf_image(self, page, page_num):
+        try:
+            pix = page.get_pixmap(dpi=OCR_DPI)
+            if self.is_likely_blank_pixmap(pix):
+                return ""
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.rgb)
+            text = pytesseract.image_to_string(img, lang='eng', config=TESSERACT_PSM_CONFIG)
+            pix = None
+            img.close()
+            del img
+            gc.collect()
+            return text
+        except Exception as e:
+            self.log_message.emit(f"PyMuPDF image OCR failed for page {page_num}: {e}")
+            return ""
+
+    def extract_images_from_page(self, page):
+        image_list = []
+        try:
+            image_list.extend(page.get_images(full=True))
+        except Exception as e:
+            self.log_message.emit(f"Failed to extract images from page: {e}")
+        return image_list
+
+    def analyze_image(self, image_info, page_num, doc):
+        try:
+            xref = image_info[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image_ext = base_image.get("ext", "").lower()
+            if image_ext not in ["png", "jpeg", "jpg", "bmp", "tiff"]:
+                self.log_message.emit(f"Unsupported image format '{image_ext}' on page {page_num}, skipping")
+                return ""
+            if len(image_bytes) < MIN_IMAGE_SIZE_BYTES:
+                return ""
+            img = Image.open(io.BytesIO(image_bytes))
+            if img.width > MAX_IMAGE_DIMENSION or img.height > MAX_IMAGE_DIMENSION:
+                img = img.resize((min(img.width, MAX_IMAGE_DIMENSION), min(img.height, MAX_IMAGE_DIMENSION)),
+                                 Image.Resampling.LANCZOS)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            text = pytesseract.image_to_string(img, lang='eng', config=TESSERACT_PSM_CONFIG)
+            img.close()
+            del img, base_image
+            gc.collect()
+            return text
+        except Exception as e:
+            self.log_message.emit(f"Image analysis failed for page {page_num}: {e}")
+            return ""
 
     def analyze_pdf(self, pdf_path):
         blank_pages = 0
@@ -95,270 +183,368 @@ class AnalysisWorker(QObject):
         try:
             doc = fitz.open(pdf_path)
             total_pages = len(doc)
-            self.log_signal.emit(f"Total pages: {total_pages}")
 
             for i in range(total_pages):
+                if not self.is_running:
+                    doc.close()
+                    return None
+
                 page_num = i + 1
-                self.log_signal.emit(f"Processing page {page_num}/{total_pages}...")
+                self.update_progress.emit(f"Analyzing page {page_num}/{total_pages}", i + 1, total_pages)
+
                 try:
                     page = doc[i]
                     text = page.get_text("text") or ""
-                    self.log_signal.emit(f"PyMuPDF text length for page {page_num}: {len(text)} characters")
                 except Exception as e:
-                    logger.warning(f"Text extraction failed for page {page_num}: {e}")
+                    self.log_message.emit(f"Text extraction failed for page {page_num}: {e}")
                     text = ""
 
-                if not text.strip():
-                    self.log_signal.emit(f"Attempting OCR for page {page_num}")
-                    text = extract_text_with_pymupdf_image(page, page_num, self.log_signal.emit)
+                if len(text.strip()) >= self.blank_threshold and not self.is_gibberish_page(text,
+                                                                                            self.valid_word_threshold):
+                    status = "Billable"
+                    billable_pages += 1
+                    self.log_message.emit(
+                        f"Page {page_num}: {status}\n"
+                        f"Text Length: {len(text)}\n"
+                        f"Combined Text Length: {len(text)}"
+                    )
+                    page_details.append([page_num, status, len(text)])
+                    continue
 
-                if is_blank_page(text):
+                if not text.strip():
+                    text = self.extract_text_with_pymupdf_image(page, page_num)
+
+                image_text = ""
+                image_list = self.extract_images_from_page(page)
+                if image_list:
+                    for img_info in image_list:
+                        if not self.is_running:
+                            doc.close()
+                            return None
+                        image_text += self.analyze_image(img_info, page_num, doc) + " "
+
+                combined_text = text + " " + image_text
+
+                if self.is_blank_page(combined_text, self.blank_threshold):
                     status = "Blank"
                     blank_pages += 1
-                elif is_gibberish_page(text):
+                elif self.is_gibberish_page(combined_text, self.valid_word_threshold):
                     status = "Gibberish"
                     gibberish_pages += 1
                 else:
                     status = "Billable"
                     billable_pages += 1
-                self.log_signal.emit(f"Page {page_num}: {status}")
-                page_details.append((page_num, status, len(text)))
+
+                self.log_message.emit(
+                    f"Page {page_num}: {status}\n"
+                    f"Text Length: {len(text)}\n"
+                    f"Combined Text Length: {len(combined_text)}"
+                )
+                page_details.append([page_num, status, len(text)])
 
             doc.close()
-
-            result = {
-                "file": os.path.basename(pdf_path),
-                "total_pages": total_pages,
-                "blank_pages": blank_pages,
-                "gibberish_pages": gibberish_pages,
-                "billable_pages": billable_pages,
-                "page_details": page_details
-            }
-            self.csv_data.append({
-                "File": os.path.basename(pdf_path),
-                "Total Pages": total_pages,
-                "Blank Pages": blank_pages,
-                "Gibberish Pages": gibberish_pages,
-                "Billable Pages": billable_pages
-            })
-            for page_num, status, text_length in page_details:
-                self.csv_data.append({
-                    "File": os.path.basename(pdf_path),
-                    "Page Number": page_num,
-                    "Status": status,
-                    "Text Length": text_length
-                })
-            return result
+            del doc
+            gc.collect()
 
         except Exception as e:
-            logger.error(f"Error processing PDF: {e}")
-            self.log_signal.emit(f"Error processing PDF: {e}")
+            self.log_message.emit(f"Error processing PDF: {e}")
             return None
 
-    def run(self):
-        for idx, pdf_path in enumerate(self.pdf_files, 1):
-            self.log_signal.emit(f"\nAnalyzing PDF {idx}/{len(self.pdf_files)}: {os.path.basename(pdf_path)}")
-            self.status_signal.emit(f"Processing file {idx}/{len(self.pdf_files)}")
+        return {
+            "total_pages": total_pages,
+            "blank_pages": blank_pages,
+            "gibberish_pages": gibberish_pages,
+            "billable_pages": billable_pages,
+            "page_details": page_details
+        }
 
-            if not os.path.exists(pdf_path):
-                self.log_signal.emit(f"Error: File {pdf_path} not found.")
-                continue
 
-            result = self.analyze_pdf(pdf_path)
-            if result:
-                self.log_signal.emit(f"\nSummary for {result['file']}:")
-                self.log_signal.emit(f"Total Pages: {result['total_pages']}")
-                self.log_signal.emit(f"Blank Pages: {result['blank_pages']}")
-                self.log_signal.emit(f"Gibberish Pages: {result['gibberish_pages']}")
-                self.log_signal.emit(f"Billable Pages: {result['billable_pages']}")
-                self.result_signal.emit(result)
-
-        if self.csv_data:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            csv_file = f"pdf_analysis_{timestamp}.csv"
-            with open(csv_file, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=["File", "Total Pages", "Blank Pages", "Gibberish Pages", "Billable Pages", "Page Number", "Status", "Text Length"])
-                writer.writeheader()
-                for row in self.csv_data:
-                    writer.writerow({k: v for k, v in row.items() if k in writer.fieldnames})
-            self.log_signal.emit(f"\nResults saved to {csv_file}")
-
-        self.status_signal.emit("Analysis Complete")
-        self.finished_signal.emit()
-
-class PDFAnalyzerApp(QMainWindow):
+# Main GUI Window
+class PDFAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PDF Page Analyzer")
-        self.setGeometry(100, 100, 800, 600)
+        self.setWindowTitle("PDF Analyzer")
+        self.setGeometry(100, 100, 900, 700)
 
-        self.central_widget = QWidget()
-        self.setCentralWidget(self.central_widget)
-        self.layout = QVBoxLayout(self.central_widget)
-        self.layout.setSpacing(10)
-
-        file_widget = QWidget()
-        file_layout = QVBoxLayout(file_widget)
-        file_layout.setContentsMargins(10, 10, 10, 10)
-        file_widget.setStyleSheet("background-color: #e9ecef; border-radius: 5px;")
-        self.file_label = QLabel("Selected PDFs: None")
-        self.file_label.setStyleSheet("font: bold 14px 'Segoe UI'; color: #2b3e50;")
-        file_layout.addWidget(self.file_label)
-        button_layout = QHBoxLayout()
-        self.browse_button = QPushButton("Browse PDFs")
-        self.browse_button.setStyleSheet("background-color: #28a745; color: white; font: bold 12px 'Segoe UI'; padding: 8px; border-radius: 5px;")
-        self.browse_button.clicked.connect(self.browse_files)
-        self.analyze_button = QPushButton("Analyze PDFs")
-        self.analyze_button.setStyleSheet("background-color: #28a745; color: white; font: bold 12px 'Segoe UI'; padding: 8px; border-radius: 5px;")
-        self.analyze_button.clicked.connect(self.analyze_pdfs)
-        button_layout.addWidget(self.browse_button)
-        button_layout.addWidget(self.analyze_button)
-        file_layout.addLayout(button_layout)
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("font: italic 12px 'Segoe UI'; color: #2b3e50;")
-        file_layout.addWidget(self.status_label)
-        self.layout.addWidget(file_widget)
-
-        log_widget = QWidget()
-        log_layout = QVBoxLayout(log_widget)
-        log_layout.setContentsMargins(10, 10, 10, 10)
-        log_widget.setStyleSheet("background-color: #e9ecef; border-radius: 5px;")
-        log_label = QLabel("Processing Log")
-        log_label.setStyleSheet("font: bold 14px 'Segoe UI'; color: #2b3e50;")
-        log_layout.addWidget(log_label)
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet("background-color: white; font: 12px 'Segoe UI'; border: 1px solid #ccc; border-radius: 5px;")
-        log_layout.addWidget(self.log_text)
-        self.layout.addWidget(log_widget)
-
-        summary_widget = QWidget()
-        summary_layout = QVBoxLayout(summary_widget)
-        summary_layout.setContentsMargins(10, 10, 10, 10)
-        summary_widget.setStyleSheet("background-color: #e9ecef; border-radius: 5px;")
-        summary_label = QLabel("Summary Table")
-        summary_label.setStyleSheet("font: bold 14px 'Segoe UI'; color: #2b3e50;")
-        summary_layout.addWidget(summary_label)
-        self.summary_table = QTableWidget()
-        self.summary_table.setColumnCount(5)
-        self.summary_table.setHorizontalHeaderLabels(["File", "Total Pages", "Blank Pages", "Gibberish Pages", "Billable Pages"])
-        self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.summary_table.setStyleSheet("background-color: white; font: 12px 'Segoe UI'; alternate-background-color: #f4f6f9;")
-        self.summary_table.horizontalHeader().setStyleSheet("QHeaderView::section { background-color: #3b5998; color: white; font: bold 12px 'Segoe UI'; border: 1px solid #2b3e50; padding: 4px; }")
-        self.summary_table.setSortingEnabled(True)
-        self.summary_table.horizontalHeader().setSectionsClickable(True)
-        self.summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        summary_scroll = QScrollArea()
-        summary_scroll.setWidget(self.summary_table)
-        summary_scroll.setWidgetResizable(True)
-        summary_layout.addWidget(summary_scroll)
-        self.layout.addWidget(summary_widget)
-
-        result_widget = QWidget()
-        result_layout = QVBoxLayout(result_widget)
-        result_layout.setContentsMargins(10, 10, 10, 10)
-        result_widget.setStyleSheet("background-color: #e9ecef; border-radius: 5px;")
-        result_label = QLabel("Results Table")
-        result_label.setStyleSheet("font: bold 14px 'Segoe UI'; color: #2b3e50;")
-        result_layout.addWidget(result_label)
-        self.result_table = QTableWidget()
-        self.result_table.setColumnCount(4)
-        self.result_table.setHorizontalHeaderLabels(["File", "Page Number", "Status", "Text Length"])
-        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.result_table.setStyleSheet("background-color: white; font: 12px 'Segoe UI'; alternate-background-color: #f4f6f9;")
-        self.result_table.horizontalHeader().setStyleSheet("QHeaderView::section { background-color: #3b5998; color: white; font: bold 12px 'Segoe UI'; border: 1px solid #2b3e50; padding: 4px; }")
-        self.result_table.setSortingEnabled(True)
-        self.result_table.horizontalHeader().setSectionsClickable(True)
-        self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        result_scroll = QScrollArea()
-        result_scroll.setWidget(self.result_table)
-        result_scroll.setWidgetResizable(True)
-        result_layout.addWidget(result_scroll)
-        self.layout.addWidget(result_widget)
-
-        self.selected_files = []
+        self.pdf_paths = []  # List of selected PDF paths
         self.thread = None
-        self.worker = None
+        self.all_page_details = []  # Store all page details for export
+        self.init_ui()
 
-    def browse_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select PDF Files", "", "PDF Files (*.pdf)")
-        if files:
-            self.selected_files = files
-            self.file_label.setText(f"Selected PDFs: {len(files)} file(s)")
-            self.log_text.clear()
-            self.log_text.append(f"Selected {len(files)} PDF(s)")
-            self.summary_table.setRowCount(0)
-            self.result_table.setRowCount(0)
-            self.status_label.setText("Ready")
+        # Apply modern stylesheet with new colors
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f7fa;
+            }
+            QPushButton {
+                background-color: #ff7b1c;
+                color: white;
+                border-radius: 5px;
+                padding: 8px;
+                font-size: 14px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #d45b04;
+            }
+            QPushButton:disabled {
+                background-color: #ffb07c;
+            }
+            QLineEdit {
+                border: 1px solid #dcdcdc;
+                border-radius: 5px;
+                padding: 5px;
+                font-size: 14px;
+                background-color: white;
+            }
+            QTableWidget {
+                border: 1px solid #dcdcdc;
+                border-radius: 5px;
+                background-color: white;
+                font-size: 14px;
+            }
+            QTableWidget::item {
+                padding: 5px;
+            }
+            QHeaderView::section {
+                background-color: #ff7b1c;
+                color: white;
+                padding: 5px;
+                border: none;
+            }
+            QHeaderView::section:hover {
+                background-color: #d45b04;
+            }
+            QTextEdit {
+                border: 1px solid #dcdcdc;
+                border-radius: 5px;
+                background-color: white;
+                font-size: 14px;
+            }
+            QLabel {
+                font-size: 14px;
+                color: #333;
+            }
+            QProgressBar {
+                border: 1px solid #dcdcdc;
+                border-radius: 5px;
+                text-align: center;
+                font-size: 14px;
+            }
+            QProgressBar::chunk {
+                background-color: #ff7b1c;
+                border-radius: 3px;
+            }
+            QProgressBar::chunk:disabled {
+                background-color: #ffb07c;
+            }
+        """)
 
-    def analyze_pdfs(self):
-        if not self.selected_files:
-            QMessageBox.critical(self, "Error", "Please select at least one PDF file.")
+    def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # File selection
+        file_layout = QHBoxLayout()
+        self.file_label = QLabel("No files selected")
+        file_button = QPushButton("Select PDF Files")
+        file_button.clicked.connect(self.select_files)
+        file_layout.addWidget(self.file_label)
+        file_layout.addWidget(file_button)
+        layout.addLayout(file_layout)
+
+        # Threshold inputs
+        threshold_layout = QHBoxLayout()
+        blank_label = QLabel("Blank Page Char Threshold:")
+        self.blank_threshold_input = QLineEdit(str(BLANK_PAGE_CHAR_THRESHOLD))
+        self.blank_threshold_input.setValidator(QDoubleValidator(0, 10000, 2))
+        self.blank_threshold_input.setFixedWidth(100)
+        valid_word_label = QLabel("Valid Word Threshold:")
+        self.valid_word_threshold_input = QLineEdit(str(VALID_WORD_THRESHOLD))
+        self.valid_word_threshold_input.setValidator(QDoubleValidator(0, 1, 2))
+        self.valid_word_threshold_input.setFixedWidth(100)
+        threshold_layout.addWidget(blank_label)
+        threshold_layout.addWidget(self.blank_threshold_input)
+        threshold_layout.addWidget(valid_word_label)
+        threshold_layout.addWidget(self.valid_word_threshold_input)
+        threshold_layout.addStretch()
+        layout.addLayout(threshold_layout)
+
+        # Start and Cancel buttons
+        button_layout = QHBoxLayout()
+        self.start_button = QPushButton("Start Analysis")
+        self.start_button.clicked.connect(self.start_analysis)
+        self.start_button.setEnabled(False)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.cancel_analysis)
+        self.cancel_button.setEnabled(False)
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.cancel_button)
+        layout.addLayout(button_layout)
+
+        # Status label and Progress bar
+        self.status_label = QLabel("Status: Idle")
+        layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        # Summary Table
+        self.summary_table = QTableWidget()
+        self.summary_table.setRowCount(1)
+        self.summary_table.setColumnCount(4)
+        self.summary_table.setHorizontalHeaderLabels(
+            ["Total Pages", "Blank Pages", "Gibberish Pages", "Billable Pages"])
+        self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.summary_table)
+
+        # Results Table
+        self.results_table = QTableWidget()
+        self.results_table.setColumnCount(4)  # Added File column
+        self.results_table.setHorizontalHeaderLabels(["File", "Page Number", "Status", "Text Length"])
+        self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.results_table.setSortingEnabled(True)
+        layout.addWidget(self.results_table)
+
+        # Export to CSV button
+        self.export_button = QPushButton("Export to CSV")
+        self.export_button.clicked.connect(self.export_to_csv)
+        self.export_button.setEnabled(False)
+        layout.addWidget(self.export_button)
+
+        # Log viewer
+        self.log_viewer = QTextEdit()
+        self.log_viewer.setReadOnly(True)
+        self.log_viewer.setMinimumHeight(150)
+        layout.addWidget(self.log_viewer)
+
+        # Configure logging to display in log viewer
+        handler = QTextEditLogger(self.log_viewer)
+        handler.setFormatter(logging.Formatter('%(message)s'))
+        global logger
+        logger.handlers = []  # Clear existing handlers to avoid duplicates
+        logger.addHandler(handler)
+
+    def select_files(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Select PDF Files", "", "PDF Files (*.pdf)")
+        if file_paths:
+            self.pdf_paths = file_paths
+            self.file_label.setText(f"{len(file_paths)} file(s) selected")
+            self.start_button.setEnabled(True)
+            self.status_label.setText("Status: Files selected, ready to analyze")
+
+    def start_analysis(self):
+        if not self.pdf_paths:
+            QMessageBox.warning(self, "Error", "Please select at least one PDF file.")
             return
 
-        self.log_text.clear()
-        self.summary_table.setRowCount(0)
-        self.result_table.setRowCount(0)
-        self.status_label.setText("Processing...")
-        self.analyze_button.setEnabled(False)
+        try:
+            blank_threshold = float(self.blank_threshold_input.text())
+            valid_word_threshold = float(self.valid_word_threshold_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Invalid threshold values. Please enter numeric values.")
+            return
 
-        self.thread = QThread()
-        self.worker = AnalysisWorker(self.selected_files)
-        self.worker.moveToThread(self.thread)
+        self.start_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.export_button.setEnabled(False)
+        self.status_label.setText("Status: Analyzing...")
+        self.summary_table.clearContents()
+        self.results_table.setRowCount(0)
+        self.log_viewer.clear()
+        self.all_page_details = []
+        self.progress_bar.setValue(0)
 
-        self.worker.log_signal.connect(self.log_text.append)
-        self.worker.status_signal.connect(self.status_label.setText)
-        self.worker.result_signal.connect(self.update_tables)
-        self.worker.finished_signal.connect(self.on_analysis_finished)
-        self.thread.started.connect(self.worker.run)
-
+        self.thread = AnalysisThread(self.pdf_paths, blank_threshold, valid_word_threshold)
+        self.thread.update_progress.connect(self.update_progress)
+        self.thread.log_message.connect(self.log_viewer.append)
+        self.thread.analysis_complete.connect(self.on_analysis_complete)
+        self.thread.analysis_failed.connect(self.on_analysis_failed)
         self.thread.start()
 
-    def update_tables(self, result):
-        # Populate Summary Table
-        row = self.summary_table.rowCount()
-        self.summary_table.insertRow(row)
-        self.summary_table.setItem(row, 0, QTableWidgetItem(str(result['file'])))
-        self.summary_table.setItem(row, 1, QTableWidgetItem(str(result['total_pages'])))
-        self.summary_table.setItem(row, 2, QTableWidgetItem(str(result['blank_pages'])))
-        self.summary_table.setItem(row, 3, QTableWidgetItem(str(result['gibberish_pages'])))
-        self.summary_table.setItem(row, 4, QTableWidgetItem(str(result['billable_pages'])))
+    def update_progress(self, message, current, total):
+        self.status_label.setText(f"Status: {message}")
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
 
-        # Populate Results Table
-        for page_num, status, text_length in result['page_details']:
-            row = self.result_table.rowCount()
-            self.result_table.insertRow(row)
+    def cancel_analysis(self):
+        if self.thread:
+            self.thread.stop()
+            self.status_label.setText("Status: Analysis cancelled")
+            self.start_button.setEnabled(True)
+            self.cancel_button.setEnabled(False)
+            self.progress_bar.setValue(0)
 
-            # File
-            file_item = QTableWidgetItem(str(result['file']))
-            self.result_table.setItem(row, 0, file_item)
+    def on_analysis_complete(self, results):
+        self.start_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.export_button.setEnabled(True)
+        self.status_label.setText("Status: Analysis complete")
+        self.progress_bar.setValue(self.progress_bar.maximum())
 
-            # Page Number (set Qt.UserRole for numeric sorting)
-            page_item = QTableWidgetItem(str(page_num))
-            page_item.setData(Qt.UserRole, int(page_num))
-            self.result_table.setItem(row, 1, page_item)
+        # Aggregate summary
+        total_pages = sum(result['total_pages'] for result in results)
+        blank_pages = sum(result['blank_pages'] for result in results)
+        gibberish_pages = sum(result['gibberish_pages'] for result in results)
+        billable_pages = sum(result['billable_pages'] for result in results)
 
-            # Status
-            status_item = QTableWidgetItem(str(status))
-            self.result_table.setItem(row, 2, status_item)
+        # Update Summary Table
+        self.summary_table.setItem(0, 0, QTableWidgetItem(str(total_pages)))
+        self.summary_table.setItem(0, 1, QTableWidgetItem(str(blank_pages)))
+        self.summary_table.setItem(0, 2, QTableWidgetItem(str(gibberish_pages)))
+        self.summary_table.setItem(0, 3, QTableWidgetItem(str(billable_pages)))
 
-            # Text Length (set Qt.UserRole for numeric sorting)
-            length_item = QTableWidgetItem(str(text_length))
-            length_item.setData(Qt.UserRole, int(text_length))
-            self.result_table.setItem(row, 3, length_item)
+        # Update Results Table
+        row = 0
+        for result in results:
+            for page_detail in result['page_details']:
+                self.results_table.setRowCount(row + 1)
+                # page_detail = [filename, page_num, status, text_length]
+                self.results_table.setItem(row, 0, QTableWidgetItem(page_detail[0]))  # File
+                self.results_table.setItem(row, 1, QTableWidgetItem(str(page_detail[1])))  # Page Number
+                self.results_table.setItem(row, 2, QTableWidgetItem(page_detail[2]))  # Status
+                self.results_table.setItem(row, 3, QTableWidgetItem(str(page_detail[3])))  # Text Length
+                row += 1
+            self.all_page_details.extend(result['page_details'])
 
-        # Force table repaint
-        self.result_table.viewport().update()
+        # Log final summary
+        self.log_viewer.append(f"\nFinal Summary:")
+        self.log_viewer.append(f"Total Pages: {total_pages}")
+        self.log_viewer.append(f"Blank Pages: {blank_pages}")
+        self.log_viewer.append(f"Gibberish Pages: {gibberish_pages}")
+        self.log_viewer.append(f"Billable Pages: {billable_pages}")
 
-    def on_analysis_finished(self):
-        self.analyze_button.setEnabled(True)
-        self.thread.quit()
-        self.thread.wait()
-        self.thread = None
-        self.worker = None
+    def on_analysis_failed(self, message):
+        self.start_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.status_label.setText("Status: Analysis failed")
+        self.progress_bar.setValue(0)
+        QMessageBox.critical(self, "Error", message)
+
+    def export_to_csv(self):
+        if not self.all_page_details:
+            QMessageBox.warning(self, "Error", "No analysis data to export.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save CSV File", "", "CSV Files (*.csv)")
+        if file_path:
+            try:
+                with open(file_path, 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(["File", "Page Number", "Status", "Text Length"])
+                    for detail in self.all_page_details:
+                        writer.writerow(detail)
+                QMessageBox.information(self, "Success", f"Results exported to {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export CSV: {str(e)}")
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = PDFAnalyzerApp()
+    window = PDFAnalyzerGUI()
     window.show()
     sys.exit(app.exec_())
