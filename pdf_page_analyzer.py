@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
                              QTextEdit, QLineEdit, QHeaderView, QMessageBox, QProgressBar)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QDoubleValidator, QFont, QIcon, QPixmap
+from PyQt5.QtGui import QDoubleValidator, QFont, QIcon
 from PyQt5.QtWidgets import QGraphicsDropShadowEffect
 from PyQt5.QtGui import QColor
 
@@ -29,14 +29,22 @@ OCR_DPI = 100
 TESSERACT_PSM_CONFIG = '--psm 6'
 MAX_WORKERS = 4  # Number of threads for image processing
 
-# Configure Tesseract path
+# Configure Tesseract path dynamically for bundled app
+def get_bundle_dir():
+    if getattr(sys, 'frozen', False):
+        return sys._MEIPASS
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+bundle_dir = get_bundle_dir()
+
 if getattr(sys, 'frozen', False):
-    bundle_dir = sys._MEIPASS
     tesseract_path = os.path.join(bundle_dir, 'tesseract', 'tesseract.exe' if sys.platform == 'win32' else 'tesseract')
     pytesseract.pytesseract.tesseract_cmd = tesseract_path
     os.environ['TESSDATA_PREFIX'] = os.path.join(bundle_dir, 'tessdata')
 else:
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    pytesseract.pytesseract.tesseract_cmd = os.path.join(bundle_dir, 'tesseract', 'tesseract.exe' if sys.platform == 'win32' else 'tesseract')
+    os.environ['TESSDATA_PREFIX'] = os.path.join(bundle_dir, 'tessdata')
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -45,7 +53,6 @@ logger = logging.getLogger(__name__)
 # Initialize dictionary and word cache
 dictionary = enchant.Dict("en_US")
 word_cache = {}  # Cache for dictionary lookups
-
 
 # Custom logging handler to emit logs to QTextEdit
 class QTextEditLogger(logging.Handler):
@@ -56,7 +63,6 @@ class QTextEditLogger(logging.Handler):
     def emit(self, record):
         msg = self.format(record)
         self.text_edit.append(msg)
-
 
 # Thread for running PDF analysis
 class AnalysisThread(QThread):
@@ -176,7 +182,7 @@ class AnalysisThread(QThread):
             img = Image.open(io.BytesIO(image_bytes))
             if img.width > MAX_IMAGE_DIMENSION or img.height > MAX_IMAGE_DIMENSION:
                 img = img.resize((min(img.width, MAX_IMAGE_DIMENSION), min(img.height, MAX_IMAGE_DIMENSION)),
-                                 Image.Resampling.LANCZOS)
+                                Image.Resampling.LANCZOS)
             if img.mode != "RGB":
                 img = img.convert("RGB")
             text = pytesseract.image_to_string(img, lang='eng', config=TESSERACT_PSM_CONFIG)
@@ -214,7 +220,7 @@ class AnalysisThread(QThread):
                     text = ""
 
                 if len(text.strip()) >= self.blank_threshold and not self.is_gibberish_page(text,
-                                                                                            self.valid_word_threshold):
+                                                                                           self.valid_word_threshold):
                     status = "Billable"
                     billable_pages += 1
                     self.log_message.emit(
@@ -278,12 +284,11 @@ class AnalysisThread(QThread):
             "page_details": page_details
         }
 
-
 # Main GUI Window
 class PDFAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PDF Analyzer")
+        self.setWindowTitle("PDF Text Analyzer")
         self.setGeometry(100, 100, 900, 700)
 
         self.pdf_paths = []  # List of selected PDF paths
@@ -291,9 +296,12 @@ class PDFAnalyzerGUI(QMainWindow):
         self.all_page_details = []  # Store all page details for export
         self.init_ui()
 
-        # Set window icon (logo)
-        # Replace 'logo.ico' with the path to your logo file (e.g., 'path/to/logo.ico')
-        self.setWindowIcon(QIcon('logo.ico'))
+        # Set window icon (logo) with debug logging
+        icon_path = os.path.join(bundle_dir, 'logo.ico' if sys.platform == 'win32' else 'logo.icns')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        else:
+            logger.warning(f"Icon file not found at: {icon_path}")
 
         # Apply modern stylesheet with new colors
         self.setStyleSheet("""
@@ -419,16 +427,14 @@ class PDFAnalyzerGUI(QMainWindow):
 
         # Summary Table
         self.summary_table = QTableWidget()
-        self.summary_table.setRowCount(1)
-        self.summary_table.setColumnCount(4)
-        self.summary_table.setHorizontalHeaderLabels(
-            ["Total Pages", "Blank Pages", "Gibberish Pages", "Billable Pages"])
+        self.summary_table.setColumnCount(5)
+        self.summary_table.setHorizontalHeaderLabels(["File", "Total Pages", "Blank Pages", "Gibberish Pages", "Billable Pages"])
         self.summary_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.summary_table)
 
         # Results Table
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(4)  # Added File column
+        self.results_table.setColumnCount(4)  # File, Page Number, Status, Text Length
         self.results_table.setHorizontalHeaderLabels(["File", "Page Number", "Status", "Text Length"])
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.results_table.setSortingEnabled(True)
@@ -497,6 +503,7 @@ class PDFAnalyzerGUI(QMainWindow):
         self.export_button.setEnabled(False)
         self.status_label.setText("Status: Analyzing...")
         self.summary_table.clearContents()
+        self.summary_table.setRowCount(0)
         self.results_table.setRowCount(0)
         self.log_viewer.clear()
         self.all_page_details = []
@@ -529,17 +536,33 @@ class PDFAnalyzerGUI(QMainWindow):
         self.status_label.setText("Status: Analysis complete")
         self.progress_bar.setValue(self.progress_bar.maximum())
 
-        # Aggregate summary
+        # Update Summary Table with per-file results
+        self.summary_table.setUpdatesEnabled(False)  # Disable updates for performance
+        row = 0
+        for result in results:
+            self.summary_table.setRowCount(row + 1)
+            filename = result['filename']
+            self.summary_table.setItem(row, 0, QTableWidgetItem(filename))
+            self.summary_table.setItem(row, 1, QTableWidgetItem(str(result['total_pages'])))
+            self.summary_table.setItem(row, 2, QTableWidgetItem(str(result['blank_pages'])))
+            self.summary_table.setItem(row, 3, QTableWidgetItem(str(result['gibberish_pages'])))
+            self.summary_table.setItem(row, 4, QTableWidgetItem(str(result['billable_pages'])))
+            row += 1
+
+        # Add overall totals as the last row
         total_pages = sum(result['total_pages'] for result in results)
         blank_pages = sum(result['blank_pages'] for result in results)
         gibberish_pages = sum(result['gibberish_pages'] for result in results)
         billable_pages = sum(result['billable_pages'] for result in results)
+        self.summary_table.setRowCount(row + 1)
+        self.summary_table.setItem(row, 0, QTableWidgetItem("Total"))
+        self.summary_table.setItem(row, 1, QTableWidgetItem(str(total_pages)))
+        self.summary_table.setItem(row, 2, QTableWidgetItem(str(blank_pages)))
+        self.summary_table.setItem(row, 3, QTableWidgetItem(str(gibberish_pages)))
+        self.summary_table.setItem(row, 4, QTableWidgetItem(str(billable_pages)))
 
-        # Update Summary Table
-        self.summary_table.setItem(0, 0, QTableWidgetItem(str(total_pages)))
-        self.summary_table.setItem(0, 1, QTableWidgetItem(str(blank_pages)))
-        self.summary_table.setItem(0, 2, QTableWidgetItem(str(gibberish_pages)))
-        self.summary_table.setItem(0, 3, QTableWidgetItem(str(billable_pages)))
+        self.summary_table.setSortingEnabled(True)  # Enable sorting on all columns
+        self.summary_table.setUpdatesEnabled(True)  # Re-enable updates
 
         # Update Results Table in batches
         self.results_table.setUpdatesEnabled(False)  # Disable updates for performance
@@ -586,7 +609,6 @@ class PDFAnalyzerGUI(QMainWindow):
                 QMessageBox.information(self, "Success", f"Results exported to {file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export CSV: {str(e)}")
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
