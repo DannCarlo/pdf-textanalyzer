@@ -29,7 +29,7 @@ OCR_DPI = 100
 TESSERACT_PSM_CONFIG = '--psm 6'
 MAX_WORKERS = 4  # Number of threads for image processing
 
-# Configure Tesseract path dynamically for bundled app
+# Configure Tesseract path dynamically
 def get_bundle_dir():
     if getattr(sys, 'frozen', False):
         return sys._MEIPASS
@@ -39,12 +39,10 @@ def get_bundle_dir():
 bundle_dir = get_bundle_dir()
 
 if getattr(sys, 'frozen', False):
-    tesseract_path = os.path.join(bundle_dir, 'tesseract', 'tesseract.exe' if sys.platform == 'win32' else 'tesseract')
-    pytesseract.pytesseract.tesseract_cmd = tesseract_path
-    os.environ['TESSDATA_PREFIX'] = os.path.join(bundle_dir, 'tessdata')
-else:
-    pytesseract.pytesseract.tesseract_cmd = os.path.join(bundle_dir, 'tesseract', 'tesseract.exe' if sys.platform == 'win32' else 'tesseract')
-    os.environ['TESSDATA_PREFIX'] = os.path.join(bundle_dir, 'tessdata')
+    bundle_dir = sys._MEIPASS
+
+pytesseract.pytesseract.tesseract_cmd = os.path.join(bundle_dir, 'tesseract', 'tesseract.exe' if sys.platform == 'win32' else 'tesseract')
+os.environ['TESSDATA_PREFIX'] = os.path.join(bundle_dir, 'tesseract', 'tessdata')
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -85,14 +83,14 @@ class AnalysisThread(QThread):
             for file_idx, pdf_path in enumerate(self.pdf_paths):
                 if not self.is_running:
                     break
-                self.log_message.emit(f"\nProcessing file: {os.path.basename(pdf_path)}")
+                filename = os.path.basename(pdf_path)  # Define filename before using it
+                self.log_message.emit(f"\nProcessing file: {filename}")
                 result = self.analyze_pdf(pdf_path)
                 if result:
                     # Add filename to page details for Results Table
-                    filename = os.path.basename(pdf_path)
                     result['filename'] = filename
                     for detail in result['page_details']:
-                        detail.insert(0, filename)  # Add filename to each page detail
+                        detail.insert(0, filename)
                     all_results.append(result)
                 # Update progress for file completion
                 self.update_progress.emit(f"Processing {filename}", file_idx + 1, total_files)
@@ -294,9 +292,10 @@ class PDFAnalyzerGUI(QMainWindow):
         self.pdf_paths = []  # List of selected PDF paths
         self.thread = None
         self.all_page_details = []  # Store all page details for export
+        self.file_button = None  # Reference to the "Select PDF Files" button
         self.init_ui()
 
-        # Set window icon (logo) with debug logging
+        # Set window icon (logo) dynamically based on platform
         icon_path = os.path.join(bundle_dir, 'logo.ico' if sys.platform == 'win32' else 'logo.icns')
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
@@ -382,10 +381,10 @@ class PDFAnalyzerGUI(QMainWindow):
         # File selection
         file_layout = QHBoxLayout()
         self.file_label = QLabel("No files selected")
-        file_button = QPushButton("Select PDF Files")
-        file_button.clicked.connect(self.select_files)
+        self.file_button = QPushButton("Select PDF Files")  # Store reference to the button
+        self.file_button.clicked.connect(self.select_files)
         file_layout.addWidget(self.file_label)
-        file_layout.addWidget(file_button)
+        file_layout.addWidget(self.file_button)
         layout.addLayout(file_layout)
 
         # Threshold inputs with debounce
@@ -461,7 +460,7 @@ class PDFAnalyzerGUI(QMainWindow):
             shadow.setColor(QColor(0, 0, 0, 80))
             return shadow
 
-        file_button.setGraphicsEffect(create_shadow())
+        self.file_button.setGraphicsEffect(create_shadow())
         self.start_button.setGraphicsEffect(create_shadow())
         self.cancel_button.setGraphicsEffect(create_shadow())
         self.export_button.setGraphicsEffect(create_shadow())
@@ -498,6 +497,8 @@ class PDFAnalyzerGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Invalid threshold values. Please enter numeric values.")
             return
 
+        # Disable buttons during analysis
+        self.file_button.setEnabled(False)
         self.start_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.export_button.setEnabled(False)
@@ -524,12 +525,12 @@ class PDFAnalyzerGUI(QMainWindow):
     def cancel_analysis(self):
         if self.thread:
             self.thread.stop()
-            self.status_label.setText("Status: Analysis cancelled")
-            self.start_button.setEnabled(True)
+            self.status_label.setText("Status: Analysis cancelled | Please wait...")
             self.cancel_button.setEnabled(False)
             self.progress_bar.setValue(0)
 
     def on_analysis_complete(self, results):
+        self.file_button.setEnabled(True)
         self.start_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.export_button.setEnabled(True)
@@ -587,6 +588,7 @@ class PDFAnalyzerGUI(QMainWindow):
         self.log_viewer.append(f"Billable Pages: {billable_pages}")
 
     def on_analysis_failed(self, message):
+        self.file_button.setEnabled(True)
         self.start_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.status_label.setText("Status: Analysis failed")

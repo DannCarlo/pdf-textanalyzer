@@ -1,0 +1,117 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-bundle.txt
+
+      - name: Download and Install Tesseract for Windows
+        run: |
+          # Download Tesseract installer
+          Invoke-WebRequest -Uri https://github.com/tesseract-ocr/tesseract/releases/download/5.5.0/tesseract-ocr-w64-setup-5.5.0.20241111.exe -OutFile tesseract-installer.exe
+          # Install Tesseract to the default location (C:\Program Files\Tesseract-OCR)
+          Start-Process -FilePath "tesseract-installer.exe" -ArgumentList "/S" -Wait -NoNewWindow
+          # Verify installation
+          if (-Not (Test-Path "C:\Program Files\Tesseract-OCR\tesseract.exe")) {
+            Write-Error "Tesseract installation failed. tesseract.exe not found in C:\Program Files\Tesseract-OCR."
+            exit 1
+          }
+          # Create tesseract folder in the working directory root and copy all contents
+          New-Item -ItemType Directory -Path "tesseract" -Force
+          Copy-Item -Path "C:\Program Files\Tesseract-OCR\*" -Destination "tesseract\" -Recurse -Force
+          # Clean up the installer
+          Remove-Item tesseract-installer.exe
+
+      - name: Bundle with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed `
+            --add-data "tesseract;tesseract" `
+            --add-data "logo.ico;." `
+            --icon logo.ico `
+            --name PDF-TextAnalyzer `
+            pdf_page_analyzer.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDF-TextAnalyzer-Windows
+          path: dist/PDF-TextAnalyzer.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-bundle.txt
+          brew install tesseract
+          # Create tesseract folder in the working directory root and copy contents
+          mkdir -p tesseract
+          cp /opt/homebrew/bin/tesseract tesseract/
+          mkdir -p tesseract/tessdata
+          if [ -d "/opt/homebrew/share/tessdata" ]; then cp /opt/homebrew/share/tessdata/eng.traineddata tesseract/tessdata/; else curl -L https://github.com/tesseract-ocr/tessdata/raw/main/eng.traineddata -o tesseract/tessdata/eng.traineddata; fi
+
+      - name: Bundle with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed \
+            --add-data "tesseract:tesseract" \
+            --add-data "logo.icns:." \
+            --icon logo.icns \
+            --name PDF-TextAnalyzer \
+            pdf_page_analyzer.py
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDF-TextAnalyzer-macOS
+          path: dist/PDF-TextAnalyzer
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R
+        working-directory: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Release v1.0.${{ github.run_number }}
+          files: |
+            artifacts/PDF-TextAnalyzer-Windows/PDF-TextAnalyzer.exe
+            artifacts/PDF-TextAnalyzer-macOS/PDF-TextAnalyzer
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -2,8 +2,10 @@
 # For Pycharm
 .idea/
 
+tesseract/
+
 # For saved files
-files/*
+files/
 
 # Template ignores
 # Byte-compiled / optimized / DLL files
